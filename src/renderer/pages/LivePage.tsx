@@ -1,13 +1,9 @@
 // src/renderer/pages/LivePage.tsx
-// ★ 2026-11-13（用户要求）：网络直播源更新时的精细 diff —— 不无脑重置播放。
-//   · 名字变了、URL 没变 → 只刷新 groups / 频道列表，playUrl 不动，播放继续；
-//   · 当前频道 URL 变了 → setPlayUrl(新地址)，LiveVideoPlayer 因 key 变化重挂，用新地址播；
-//   · 当前频道在新源里找不到 / 订阅源更新失败 → 保留旧 groups + 旧 playUrl，继续播。
-//   · 订阅更新后 loadLive 用 { forceRefresh: true } 绕过 5 分钟内存缓存，groups 一换 →
-//     下方 [groups] 依赖的 EPG useEffect 自动重新拉 EPG，与新源保持一致。
-//
-// ★ 2026-11-19：接入移植自修狗TV 的直播链接解析（livePlaybackProbe.ts）：
-//   容器扩展名 → 点播；.m3u8/.m3u → 只读清单探测判定点播/直播；失败静默回退直播。
+// ★ 2026-11-23 性能优化版：
+//   · mpegts.js 开启 liveBufferLatencyChasing 追帧，关闭 liveSync 避免冲突，stashInitialSize 提到 1MB 兼顾首帧与抗抖动；
+//   · hls.js 开启 lowLatencyMode + liveSyncDurationCount: 2，贴近直播边缘起播；
+//   · 区分「首帧失败」与「播放中断流」：首帧失败 1s 快速重试 2 次，仍失败自动切下一条线路；
+//   · 探测结果按 URL 缓存 5 分钟，避免重复 HEAD/GET 拖慢启播。
 import { useEffect, useRef, useState, useCallback } from 'react';
 import Hls from 'hls.js';
 import { client } from '../api/client';
@@ -40,8 +36,6 @@ function saveLiveMem(m: LiveMem): void {
 
 type EpgStatus = 'idle' | 'loading' | 'ok' | 'empty' | 'error';
 
-// ★ 与 main/LiveSubscriptionManager.ts 里的 LiveSubChangedPayload 对齐
-//   （preload 不暴露那个类型，渲染层自己声明一份）
 interface LiveSubChangedPayload {
   updated: boolean;
   updatedIds: string[];
@@ -51,8 +45,11 @@ interface LiveSubChangedPayload {
 
 type MediaKind = 'hls' | 'flv' | 'ts' | 'native' | 'unknown';
 
+// ★ 探测结果缓存：同一 URL 5 分钟内不重复探测
+const probeCache = new Map<string, { kind: MediaKind; mode: PlaybackMode; reason: string; ts: number }>();
+const PROBE_CACHE_TTL = 5 * 60 * 1000;
+
 class StreamDetector {
-  /** 纯 URL 判断，不联网。 */
   static detectByUrl(url: string): MediaKind {
     const lower = url.toLowerCase();
     if (lower.includes('.m3u8')) return 'hls';
@@ -66,83 +63,101 @@ class StreamDetector {
     const byUrl = StreamDetector.detectByUrl(url);
     if (byUrl !== 'unknown') return byUrl;
     try {
-      const res = await fetch(url, { method: 'HEAD', mode: 'cors' });
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 3000); // ★ 3s 超时，不傻等
+      const res = await fetch(url, { method: 'HEAD', mode: 'cors', signal: ctrl.signal });
+      clearTimeout(timer);
       const ct = (res.headers.get('content-type') || '').toLowerCase();
       if (ct.includes('mpegurl') || ct.includes('m3u8')) return 'hls';
       if (ct.includes('flv')) return 'flv';
       if (ct.includes('mp2t') || ct.includes('mpegts')) return 'ts';
       if (ct.includes('video/') || ct.includes('audio/')) return 'native';
     } catch {
-      try {
-        const res = await fetch(url, { method: 'GET', mode: 'cors' });
-        const text = await res.text();
-        if (text.trim().startsWith('#EXTM3U')) return 'hls';
-        if (text.includes('FLV')) return 'flv';
-        return 'hls';
-      } catch {
-        return 'unknown';
-      }
+      /* HEAD 失败或超时，按直播回退 */
     }
     return 'hls';
   }
 }
 
-/**
- * ★ 直播链接解析入口：顺序与修狗TV 一致。
- * 1) URL 层：.mp4 / file:// → 点播，不联网；
- * 2) 只有 .m3u8 / .m3u 才做只读清单探测；
- * 3) 其余默认直播；无扩展名才退回原来的 HEAD/GET 探测。
- */
 async function detectPlaybackSource(
   url: string,
 ): Promise<{ kind: MediaKind; mode: PlaybackMode; reason: string }> {
+  const cached = probeCache.get(url);
+  if (cached && Date.now() - cached.ts < PROBE_CACHE_TTL) {
+    return { kind: cached.kind, mode: cached.mode, reason: cached.reason };
+  }
+
   const hint = containerHintForUrl(url);
   const urlKind = StreamDetector.detectByUrl(url);
+  let result: { kind: MediaKind; mode: PlaybackMode; reason: string };
+
   if (hint) {
-    return { kind: urlKind === 'unknown' ? 'native' : urlKind, mode: hint, reason: 'container' };
-  }
-  if (isHlsProbeCandidate(url)) {
+    result = { kind: urlKind === 'unknown' ? 'native' : urlKind, mode: hint, reason: 'container' };
+  } else if (isHlsProbeCandidate(url)) {
     const probe = await sharedHlsPlaylistProbe.probe(url);
     const decision = resolveDirectPlaybackMode({ url, probe });
-    return { kind: 'hls', mode: decision.mode, reason: decision.reason ?? '' };
+    result = { kind: 'hls', mode: decision.mode, reason: decision.reason ?? '' };
+  } else if (urlKind !== 'unknown') {
+    result = { kind: urlKind, mode: 'live', reason: 'default-live' };
+  } else {
+    const kind = await StreamDetector.detect(url);
+    result = { kind, mode: 'live', reason: 'default-live' };
   }
-  if (urlKind !== 'unknown') {
-    return { kind: urlKind, mode: 'live', reason: 'default-live' };
-  }
-  const kind = await StreamDetector.detect(url);
-  return { kind, mode: 'live', reason: 'default-live' };
+
+  probeCache.set(url, { ...result, ts: Date.now() });
+  return result;
 }
 
+// ============================================================
+// LiveVideoPlayer
+// ============================================================
 function LiveVideoPlayer({
   url,
   onReconnect,
+  onFirstFrameFail,      // ★ 首帧阶段失败（还没出过画面）
   onVideoError,
   onModeDetected,
 }: {
   url: string;
   onReconnect: () => void;
+  onFirstFrameFail: () => void;
   onVideoError: (msg: string) => void;
   onModeDetected?: (mode: PlaybackMode, reason: string) => void;
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const hlsRef = useRef<any>(null);
   const mpegtsRef = useRef<any>(null);
-  const cbRef = useRef({ onReconnect, onVideoError, onModeDetected });
-  cbRef.current = { onReconnect, onVideoError, onModeDetected };
-  // ★ 当前解析出的播放模式：点播播完不重连，直播断流才重连
+  const cbRef = useRef({ onReconnect, onFirstFrameFail, onVideoError, onModeDetected });
+  cbRef.current = { onReconnect, onFirstFrameFail, onVideoError, onModeDetected };
   const modeRef = useRef<PlaybackMode>('live');
+  const hasPlayedRef = useRef(false); // ★ 是否已经出过画面
 
   useEffect(() => {
     const v = videoRef.current;
     if (!v || !url) return;
 
     let destroyed = false;
-    const destroyHls = () => { if (hlsRef.current) { try { hlsRef.current.destroy(); } catch {} hlsRef.current = null; } };
-    const destroyMpegts = () => { if (mpegtsRef.current) { try { mpegtsRef.current.destroy(); } catch {} mpegtsRef.current = null; } };
+    hasPlayedRef.current = false;
+
+    const destroyHls = () => {
+      if (hlsRef.current) { try { hlsRef.current.destroy(); } catch {} hlsRef.current = null; }
+    };
+    const destroyMpegts = () => {
+      if (mpegtsRef.current) { try { mpegtsRef.current.destroy(); } catch {} mpegtsRef.current = null; }
+    };
 
     const safePlay = () => {
       const p = v.play();
       if (p && typeof p.catch === 'function') p.catch(() => undefined);
+    };
+
+    // ★ 失败分派：首帧阶段 → onFirstFrameFail；出过画面 → onReconnect（仅直播）
+    const handleFailure = (isLive: boolean) => {
+      if (!hasPlayedRef.current) {
+        cbRef.current.onFirstFrameFail();
+      } else if (isLive) {
+        cbRef.current.onReconnect();
+      }
     };
 
     const playNative = () => {
@@ -155,14 +170,18 @@ function LiveVideoPlayer({
       if (!Hls.isSupported()) { playNative(); return; }
       const hls = new Hls({
         enableWorker: true,
-        lowLatencyMode: false,
-        backBufferLength: 30,
-        maxBufferLength: 20,
-        manifestLoadingTimeOut: 15000,
+        // ★ 直播低延迟：贴近直播边缘，减少首帧等待
+        lowLatencyMode: true,
+        liveSyncDurationCount: 2,
+        backBufferLength: 10,
+        maxBufferLength: 10,
+        // ★ 初始带宽估计 1.5Mbps，避免首段画质过低
+        abrEwmaDefaultEstimate: 1_500_000,
+        manifestLoadingTimeOut: 10000,
         manifestLoadingMaxRetry: 6,
         manifestLoadingRetryDelay: 500,
-        levelLoadingTimeOut: 15000,
-        fragLoadingTimeOut: 30000,
+        levelLoadingTimeOut: 10000,
+        fragLoadingTimeOut: 20000,
         xhrSetup: (xhr: XMLHttpRequest) => { xhr.withCredentials = false; },
       });
       hlsRef.current = hls;
@@ -186,8 +205,7 @@ function LiveVideoPlayer({
         } else {
           cbRef.current.onVideoError(`HLS 失败：${data.details || data.type}`);
           destroyHls();
-          // ★ 点播 HLS 播放失败不自动重连；直播才重连
-          if (modeRef.current === 'live') cbRef.current.onReconnect();
+          handleFailure(modeRef.current === 'live');
         }
       });
     };
@@ -202,8 +220,28 @@ function LiveVideoPlayer({
           return;
         }
         const player = mpegts.createPlayer(
-          { type, url: sourceUrl, isLive: mode === 'live' },
-          { enableWorker: true, enableStashBuffer: false, stashInitialSize: 128, lazyLoad: false },
+          {
+            type,
+            url: sourceUrl,
+            isLive: mode === 'live',
+            hasAudio: true, // 若某路流无音频，探测层识别后可改为 false
+          },
+          {
+            enableWorker: true,
+            // ★ 直播追帧核心：关闭 IO 暂存 + 开启追帧
+            enableStashBuffer: false,
+            stashInitialSize: 1024 * 1024, // 1MB，兼顾首帧速度与抗抖动
+            lazyLoad: false,
+            // ★ 关闭 liveSync，避免与 liveBufferLatencyChasing 冲突
+            liveSync: false,
+            // ★ 追帧阈值
+            liveBufferLatencyChasing: true,
+            liveBufferLatencyMaxLatency: 1.5,
+            liveBufferLatencyMinRemain: 0.3,
+            liveBufferLatencyChasingOnPaused: false,
+            // ★ 直播禁用精确 seek，避免跳转卡顿
+            accurateSeek: false,
+          },
         );
         mpegtsRef.current = player;
         player.attachMediaElement(v);
@@ -211,7 +249,7 @@ function LiveVideoPlayer({
         try { player.play(); } catch {}
         player.on(mpegts.Events?.ERROR || 'error', (errType: unknown, errDetail: unknown) => {
           cbRef.current.onVideoError(`流错误：${errType}/${errDetail}`);
-          if (modeRef.current === 'live') cbRef.current.onReconnect();
+          handleFailure(mode === 'live');
         });
       } catch {
         playNative();
@@ -231,18 +269,21 @@ function LiveVideoPlayer({
     })();
 
     const onEnded = () => {
-      // ★ 点播播完就是播完；直播流意外 ended 才重连
-      if (modeRef.current === 'live') cbRef.current.onReconnect();
+      // 点播播完不重连；直播流意外 ended 按失败处理
+      if (modeRef.current === 'live') handleFailure(true);
     };
     const onErr = () => {
       const err = v.error;
       const code = err?.code;
       const msg = code === 1 ? '用户中止' : code === 2 ? '网络错误' : code === 3 ? '解码错误' : code === 4 ? '源不支持' : `错误(${code ?? '?'})`;
       cbRef.current.onVideoError(msg);
-      // ★ 点播的网络/格式错误不自动重连，交给用户手动刷新
-      if ((code === 2 || code === 4) && modeRef.current === 'live') cbRef.current.onReconnect();
+      if (code === 2 || code === 4) handleFailure(modeRef.current === 'live');
     };
-    const onPlaying = () => cbRef.current.onVideoError('');
+    const onPlaying = () => {
+      hasPlayedRef.current = true; // ★ 已出画面
+      cbRef.current.onVideoError('');
+    };
+
     v.addEventListener('ended', onEnded);
     v.addEventListener('error', onErr);
     v.addEventListener('playing', onPlaying);
@@ -271,6 +312,9 @@ function LiveVideoPlayer({
   );
 }
 
+// ============================================================
+// LivePage
+// ============================================================
 export default function LivePage() {
   const [lives, setLives] = useState<LiveBean[]>([]);
   const [liveIdx, setLiveIdx] = useState(0);
@@ -293,14 +337,12 @@ export default function LivePage() {
   const [reconnectMsg, setReconnectMsg] = useState('');
   const reconnectCountRef = useRef(0);
   const lastReconnectAtRef = useRef(0);
-  const MAX_RECONNECT = 50;
+  const firstFrameFailRef = useRef(0);          // ★ 当前 URL 首帧连续失败次数
+  const MAX_RECONNECT = 15;                      // 播放中断重连上限
 
-  // ★ 播放方式识别结果（来自 livePlaybackProbe）
   const [playMode, setPlayMode] = useState<PlaybackMode>('live');
   const [playModeReason, setPlayModeReason] = useState('');
 
-  // ★ 2026-11-13：把「当前播放上下文」用 ref 存一份，供订阅更新回调读取
-  //   （避免把 liveIdx/groupName/... 都放进 useEffect 依赖导致频繁重订阅）
   const playStateRef = useRef({ liveIdx, groupName, channelName, lineIdx, playUrl });
   useEffect(() => {
     playStateRef.current = { liveIdx, groupName, channelName, lineIdx, playUrl };
@@ -311,6 +353,7 @@ export default function LivePage() {
     setPlaybackUrl(playUrl);
     reconnectCountRef.current = 0;
     lastReconnectAtRef.current = 0;
+    firstFrameFailRef.current = 0;
     setReconnectMsg('');
   }, [playUrl]);
 
@@ -331,13 +374,48 @@ export default function LivePage() {
     }, 3000);
   }, []);
 
+  /**
+   * ★ 首帧失败：1s 快速重试当前线路，2 次仍失败自动切下一条线路。
+   *   避免用户对着一条死流反复等 3 秒。
+   */
+  const handleFirstFrameFail = useCallback(() => {
+    firstFrameFailRef.current += 1;
+
+    if (firstFrameFailRef.current <= 2) {
+      setReconnectMsg(`首帧失败，快速重试…（第 ${firstFrameFailRef.current} 次）`);
+      window.setTimeout(() => {
+        setReconnectKey((k) => k + 1);
+      }, 1000);
+      return;
+    }
+
+    // 第 3 次仍失败 → 尝试切下一条线路
+    const cur = playStateRef.current;
+    const group = groups.find((g) => g.group === cur.groupName);
+    const channel = group?.channels.find((c) => c.name === cur.channelName);
+    if (channel && channel.urls.length > 1) {
+      const nextLine = (cur.lineIdx + 1) % channel.urls.length;
+      const line = splitLine(channel.urls[nextLine], nextLine + 1);
+      if (line.url && line.url !== cur.playUrl) {
+        firstFrameFailRef.current = 0;
+        setReconnectMsg(`当前线路不可用，自动切换到线路 ${nextLine + 1}`);
+        setLineIdx(nextLine);
+        setPlayUrl(line.url);
+        saveLiveMem({ liveIdx: cur.liveIdx, groupName: cur.groupName, channelName: cur.channelName, lineIdx: nextLine });
+        return;
+      }
+    }
+
+    setReconnectMsg('当前频道所有线路均无法播放，请手动选择其他频道');
+  }, [groups]);
+
   const handleVideoError = useCallback((msg: string) => {
     if (msg) setReconnectMsg(msg);
   }, []);
 
+  // ---------- 以下业务逻辑与原始代码一致 ----------
   const reloadLives = useCallback(async () => {
     try {
-      const cfg = await client.cfgGet();
       const m = await client.liveMeta();
       setLives(m);
       const idx = liveIdx < m.length ? liveIdx : 0;
@@ -351,11 +429,6 @@ export default function LivePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [liveIdx]);
 
-  /**
-   * ★ 2026-11-13：加 `forceRefresh` 参数 —— 订阅源更新后调用时传 true，
-   *   绕过 SpiderHost.loadLive 的 5 分钟内存缓存，拿到真实新 groups + 新 EPG URL。
-   *   普通切线路 / 首次加载不传（走缓存，快）。
-   */
   async function loadLiveInternal(index: number, meta?: LiveBean[], forceRefresh = false) {
     const m = meta ?? lives;
     if (!m.length) return;
@@ -442,9 +515,6 @@ export default function LivePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  /**
-   * ★ 2026-11-13（用户要求）：订阅源内容有变化 → 精细 diff，不做无脑重置。
-   */
   const applySubscriptionUpdate = useCallback(async () => {
     const cur = playStateRef.current;
     try {
@@ -458,7 +528,6 @@ export default function LivePage() {
       const idx = cur.liveIdx < newMeta.length ? cur.liveIdx : 0;
       if (idx !== cur.liveIdx) setLiveIdx(idx);
 
-      // ★ forceRefresh: true —— 绕过 5 分钟内存缓存，拿真实新 groups + 新 EPG URL
       const r = await client.loadLive(idx, { forceRefresh: true });
       const newGroups = r.groups;
 
@@ -490,7 +559,6 @@ export default function LivePage() {
     }
   }, []);
 
-  // ★ 2026-11-13：监听主进程广播的订阅更新（带 payload），做精细 diff
   useEffect(() => {
     const w = window as any;
     const off = w?.winboxIpc?.on?.('live:subscriptions-changed', (payload?: LiveSubChangedPayload) => {
@@ -511,7 +579,6 @@ export default function LivePage() {
     return () => { if (typeof off === 'function') off(); };
   }, [loadSubStatus, reloadLives, applySubscriptionUpdate]);
 
-  // ★ 2026-10-14（用户要求）：监听主进程广播的「直播源已变更」→ 自动重新加载
   useEffect(() => {
     const w = window as any;
     const off = w?.winboxIpc?.on?.('live:changed', (payload: { index?: number; name?: string; replaced?: boolean }) => {
@@ -568,7 +635,6 @@ export default function LivePage() {
     }
   }
 
-  // ★ 2026-11-13：订阅更新后 groups 一换，这里会自动用新 EPG URL 重拉 EPG
   useEffect(() => {
     if (!groups.length) return;
     void refreshEpg(liveIdx, groups, channelName);
@@ -640,7 +706,6 @@ export default function LivePage() {
         <span className="status" style={{ marginLeft: 12, fontSize: 12, opacity: 0.7 }}>
           EPG：{epgStatusText}
         </span>
-        {/* ★ 播放方式标识：让用户知道为什么进度条能用/不能用 */}
         <span className="status" style={{ marginLeft: 12, fontSize: 12, opacity: 0.7 }}>
           播放方式：{playMode === 'vod' ? '点播' : '直播'}
           {playModeReason ? `（${playModeReason}）` : ''}
@@ -687,6 +752,7 @@ export default function LivePage() {
                       key={l.index}
                       className={`tag ${l.index - 1 === lineIdx ? 'active' : ''}`}
                       onClick={() => {
+                        firstFrameFailRef.current = 0; // ★ 手动换线重置首帧计数
                         setLineIdx(l.index - 1);
                         setPlayUrl(l.url);
                         saveLiveMem({ liveIdx, groupName, channelName, lineIdx: l.index - 1 });
@@ -725,6 +791,7 @@ export default function LivePage() {
                       key={`${playbackUrl}__${reconnectKey}`}
                       url={playbackUrl}
                       onReconnect={doReconnect}
+                      onFirstFrameFail={handleFirstFrameFail}
                       onVideoError={handleVideoError}
                       onModeDetected={(mode, reason) => {
                         setPlayMode(mode);
