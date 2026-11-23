@@ -1,9 +1,10 @@
 // src/renderer/pages/LivePage.tsx
-// ★ 2026-11-23 性能优化版：
-//   · mpegts.js 开启 liveBufferLatencyChasing 追帧，关闭 liveSync 避免冲突，stashInitialSize 提到 1MB 兼顾首帧与抗抖动；
-//   · hls.js 开启 lowLatencyMode + liveSyncDurationCount: 2，贴近直播边缘起播；
-//   · 区分「首帧失败」与「播放中断流」：首帧失败 1s 快速重试 2 次，仍失败自动切下一条线路；
-//   · 探测结果按 URL 缓存 5 分钟，避免重复 HEAD/GET 拖慢启播。
+// ★ 2026-11-23 流畅优先版（修正卡顿）：
+//   · mpegts.js: enableStashBuffer: true + stashInitialSize: 1MB，用缓冲吸收网络抖动；
+//   · liveSync 彻底关闭，只保留 liveBufferLatencyChasing 追帧；
+//   · autoCleanupSourceBuffer 开启，防止长播后 SourceBuffer 膨胀引发卡顿；
+//   · HLS 同步距离回调到 3 个分片，牺牲少量实时性换取稳定性；
+//   · 首帧失败快速重试 + 自动切线路，断流重连上限 15 次。
 import { useEffect, useRef, useState, useCallback } from 'react';
 import Hls from 'hls.js';
 import { client } from '../api/client';
@@ -45,7 +46,7 @@ interface LiveSubChangedPayload {
 
 type MediaKind = 'hls' | 'flv' | 'ts' | 'native' | 'unknown';
 
-// ★ 探测结果缓存：同一 URL 5 分钟内不重复探测
+// 探测结果缓存，同一 URL 5 分钟内不重复探测
 const probeCache = new Map<string, { kind: MediaKind; mode: PlaybackMode; reason: string; ts: number }>();
 const PROBE_CACHE_TTL = 5 * 60 * 1000;
 
@@ -64,7 +65,7 @@ class StreamDetector {
     if (byUrl !== 'unknown') return byUrl;
     try {
       const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), 3000); // ★ 3s 超时，不傻等
+      const timer = setTimeout(() => ctrl.abort(), 3000);
       const res = await fetch(url, { method: 'HEAD', mode: 'cors', signal: ctrl.signal });
       clearTimeout(timer);
       const ct = (res.headers.get('content-type') || '').toLowerCase();
@@ -109,12 +110,12 @@ async function detectPlaybackSource(
 }
 
 // ============================================================
-// LiveVideoPlayer
+// LiveVideoPlayer —— 流畅优先的播放器内核
 // ============================================================
 function LiveVideoPlayer({
   url,
   onReconnect,
-  onFirstFrameFail,      // ★ 首帧阶段失败（还没出过画面）
+  onFirstFrameFail,
   onVideoError,
   onModeDetected,
 }: {
@@ -130,7 +131,7 @@ function LiveVideoPlayer({
   const cbRef = useRef({ onReconnect, onFirstFrameFail, onVideoError, onModeDetected });
   cbRef.current = { onReconnect, onFirstFrameFail, onVideoError, onModeDetected };
   const modeRef = useRef<PlaybackMode>('live');
-  const hasPlayedRef = useRef(false); // ★ 是否已经出过画面
+  const hasPlayedRef = useRef(false);
 
   useEffect(() => {
     const v = videoRef.current;
@@ -151,7 +152,6 @@ function LiveVideoPlayer({
       if (p && typeof p.catch === 'function') p.catch(() => undefined);
     };
 
-    // ★ 失败分派：首帧阶段 → onFirstFrameFail；出过画面 → onReconnect（仅直播）
     const handleFailure = (isLive: boolean) => {
       if (!hasPlayedRef.current) {
         cbRef.current.onFirstFrameFail();
@@ -166,17 +166,21 @@ function LiveVideoPlayer({
       safePlay();
     };
 
+    // ---------- HLS: 稳定优先，同步距离回调到 3 个分片 ----------
     const playHls = (sourceUrl: string) => {
       if (!Hls.isSupported()) { playNative(); return; }
       const hls = new Hls({
         enableWorker: true,
-        // ★ 直播低延迟：贴近直播边缘，减少首帧等待
+        // ★ 不再追求 2 个分片的极限边缘，3 个分片给抖动留余量
         lowLatencyMode: true,
-        liveSyncDurationCount: 2,
-        backBufferLength: 10,
-        maxBufferLength: 10,
-        // ★ 初始带宽估计 1.5Mbps，避免首段画质过低
+        liveSyncDurationCount: 3,
+        backBufferLength: 15,
+        maxBufferLength: 15,
+        // ★ 1.5Mbps 初始估计，避免首段画质过低
         abrEwmaDefaultEstimate: 1_500_000,
+        // ★ 保守 ABR，减少码率反复切换带来的卡顿
+        abrBandWidthFactor: 0.8,
+        abrBandWidthUpFactor: 0.5,
         manifestLoadingTimeOut: 10000,
         manifestLoadingMaxRetry: 6,
         manifestLoadingRetryDelay: 500,
@@ -210,6 +214,7 @@ function LiveVideoPlayer({
       });
     };
 
+    // ---------- mpegts.js (TS/FLV): 流畅优先，缓冲吸收抖动 ----------
     const playMpegts = async (type: 'flv' | 'mpegts', sourceUrl: string, mode: PlaybackMode) => {
       try {
         // @ts-ignore 动态加载可选依赖
@@ -224,23 +229,34 @@ function LiveVideoPlayer({
             type,
             url: sourceUrl,
             isLive: mode === 'live',
-            hasAudio: true, // 若某路流无音频，探测层识别后可改为 false
+            hasAudio: true,
+            hasVideo: true,
           },
           {
             enableWorker: true,
-            // ★ 直播追帧核心：关闭 IO 暂存 + 开启追帧
-            enableStashBuffer: false,
-            stashInitialSize: 1024 * 1024, // 1MB，兼顾首帧速度与抗抖动
+            // ★★ 流畅性的基石：开启 IO 暂存缓冲，让网络抖动被缓冲吸收
+            enableStashBuffer: true,
+            // ★★ 1MB 初始缓冲，官方排障案例确认的稳定值
+            stashInitialSize: 1024 * 1024,
+
             lazyLoad: false,
-            // ★ 关闭 liveSync，避免与 liveBufferLatencyChasing 冲突
+            deferLoadAfterSourceOpen: false,
+
+            // ★★ liveSync 必须关闭，它与 liveBufferLatencyChasing 冲突，已知会导致冻结/卡死
             liveSync: false,
-            // ★ 追帧阈值
-            liveBufferLatencyChasing: true,
+            // ★★ 追帧只靠 liveBufferLatencyChasing，阈值取官方默认 1.5 / 0.5
+            liveBufferLatencyChasing: mode === 'live',
             liveBufferLatencyMaxLatency: 1.5,
-            liveBufferLatencyMinRemain: 0.3,
+            liveBufferLatencyMinRemain: 0.5,
             liveBufferLatencyChasingOnPaused: false,
-            // ★ 直播禁用精确 seek，避免跳转卡顿
+
+            // ★ 直播禁用精确 seek，消除跳转卡顿的根源
             accurateSeek: false,
+
+            // ★ 自动清理 SourceBuffer，防止长播后内存膨胀引发卡顿
+            autoCleanupSourceBuffer: true,
+            autoCleanupMaxBackwardDuration: 15,
+            autoCleanupMinBackwardDuration: 5,
           },
         );
         mpegtsRef.current = player;
@@ -269,7 +285,6 @@ function LiveVideoPlayer({
     })();
 
     const onEnded = () => {
-      // 点播播完不重连；直播流意外 ended 按失败处理
       if (modeRef.current === 'live') handleFailure(true);
     };
     const onErr = () => {
@@ -280,7 +295,7 @@ function LiveVideoPlayer({
       if (code === 2 || code === 4) handleFailure(modeRef.current === 'live');
     };
     const onPlaying = () => {
-      hasPlayedRef.current = true; // ★ 已出画面
+      hasPlayedRef.current = true;
       cbRef.current.onVideoError('');
     };
 
@@ -337,8 +352,8 @@ export default function LivePage() {
   const [reconnectMsg, setReconnectMsg] = useState('');
   const reconnectCountRef = useRef(0);
   const lastReconnectAtRef = useRef(0);
-  const firstFrameFailRef = useRef(0);          // ★ 当前 URL 首帧连续失败次数
-  const MAX_RECONNECT = 15;                      // 播放中断重连上限
+  const firstFrameFailRef = useRef(0);
+  const MAX_RECONNECT = 15;
 
   const [playMode, setPlayMode] = useState<PlaybackMode>('live');
   const [playModeReason, setPlayModeReason] = useState('');
@@ -374,10 +389,6 @@ export default function LivePage() {
     }, 3000);
   }, []);
 
-  /**
-   * ★ 首帧失败：1s 快速重试当前线路，2 次仍失败自动切下一条线路。
-   *   避免用户对着一条死流反复等 3 秒。
-   */
   const handleFirstFrameFail = useCallback(() => {
     firstFrameFailRef.current += 1;
 
@@ -389,7 +400,6 @@ export default function LivePage() {
       return;
     }
 
-    // 第 3 次仍失败 → 尝试切下一条线路
     const cur = playStateRef.current;
     const group = groups.find((g) => g.group === cur.groupName);
     const channel = group?.channels.find((c) => c.name === cur.channelName);
@@ -413,7 +423,6 @@ export default function LivePage() {
     if (msg) setReconnectMsg(msg);
   }, []);
 
-  // ---------- 以下业务逻辑与原始代码一致 ----------
   const reloadLives = useCallback(async () => {
     try {
       const m = await client.liveMeta();
@@ -752,7 +761,7 @@ export default function LivePage() {
                       key={l.index}
                       className={`tag ${l.index - 1 === lineIdx ? 'active' : ''}`}
                       onClick={() => {
-                        firstFrameFailRef.current = 0; // ★ 手动换线重置首帧计数
+                        firstFrameFailRef.current = 0;
                         setLineIdx(l.index - 1);
                         setPlayUrl(l.url);
                         saveLiveMem({ liveIdx, groupName, channelName, lineIdx: l.index - 1 });
