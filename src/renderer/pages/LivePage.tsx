@@ -160,7 +160,9 @@ function LiveVideoPlayer({
       });
     };
 
-    // ---------- mpegts.js (TS/FLV): 性能拉满 ----------
+    // ---------- mpegts.js (TS/FLV): 流畅优先 ----------
+    // 思路：IO 缓存吸收网络抖动 + 倍速平滑追帧（不丢帧）+ 极端延迟才跳帧兜底
+    let latencyGuard: number | null = null;
     const playMpegts = async (type: 'flv' | 'mpegts', sourceUrl: string, mode: PlaybackMode) => {
       try {
         // @ts-ignore 动态加载可选依赖
@@ -168,33 +170,38 @@ function LiveVideoPlayer({
         const mpegts: any = (mod as any)?.default || (mod as any);
         if (!mpegts?.isSupported?.()) { playNative(); return; }
 
+        const isLive = mode === 'live';
         const player = mpegts.createPlayer(
-          { type, url: sourceUrl, isLive: mode === 'live', hasAudio: true, hasVideo: true },
+          { type, url: sourceUrl, isLive, hasAudio: true, hasVideo: true, cors: true },
           {
-            // ★★ 核心修正：把 MSE 操作也移出主线程
-            //    mpegts.js 1.8.2 已修复 1.8.1 的 Worker 损坏问题
             enableWorker: true,
             enableWorkerForMSE: true,
 
-            // 缓冲：吸收网络抖动，但不过度堆延迟
+            // IO 缓存：用缓存熨平网络抖动，流畅优先（牺牲少量延迟）
             enableStashBuffer: true,
-            stashInitialSize: 1024 * 1024, // 1MB
+            stashInitialSize: 512 * 1024,
             lazyLoad: false,
 
-            // 追帧：关闭 liveSync，只留 liveBufferLatencyChasing
-            liveSync: false,
-            liveBufferLatencyChasing: mode === 'live',
-            liveBufferLatencyMaxLatency: 1.5,
-            liveBufferLatencyMinRemain: 0.5,
+            // ★ 平滑追帧（v1.8.0+）：动态改变 playbackRate 追赶延迟，
+            //   不丢帧、画面不顿挫，这是“酷9 式”流畅的核心
+            liveSync: isLive,
+            liveSyncMaxLatency: 2.0,      // 延迟超过 2s 开始加速
+            liveSyncTargetLatency: 1.0,   // 追回到 1s 左右
+            liveSyncPlaybackRate: 1.5,    // 追赶时 1.5 倍速（Chromium 自动保持音调）
+
+            // ★ 兜底：仅当延迟超 3s 才允许丢帧式跳帧（清到剩 1s）
+            liveBufferLatencyChasing: isLive,
+            liveBufferLatencyMaxLatency: 3.0,
+            liveBufferLatencyMinRemain: 1.0,
             liveBufferLatencyChasingOnPaused: false,
 
             // 直播禁用精确 seek
             accurateSeek: false,
 
-            // SourceBuffer 自动清理，防止长播内存膨胀
+            // 长播内存控制：清得太狠反而容易卡，放宽到 15~30s
             autoCleanupSourceBuffer: true,
-            autoCleanupMaxBackwardDuration: 15,
-            autoCleanupMinBackwardDuration: 5,
+            autoCleanupMaxBackwardDuration: 30,
+            autoCleanupMinBackwardDuration: 15,
           },
         );
         mpegtsRef.current = player;
@@ -202,15 +209,30 @@ function LiveVideoPlayer({
         player.load();
         try { player.play(); } catch {}
 
-        // ★ 打印实际编码格式，确认是否为 H.265（hevc/hvc1）
+        // ★ 打印实际编码格式：若是 H.265/HEVC 且无硬解，卡顿在解码侧，JS 无解
         player.on(mpegts.Events?.MEDIA_INFO, (info: any) => {
           console.log('[TS] 编码信息:', info?.mimeType, info?.videoCodec, info?.audioCodec);
         });
 
+        // 直播流被掐断（服务器断流/网络中断但未必抛 error）：主动走重连
+        player.on(mpegts.Events?.LOADING_COMPLETE, () => {
+          if (!destroyed && isLive) handleFailure(true);
+        });
+
         player.on(mpegts.Events?.ERROR || 'error', (errType: unknown, errDetail: unknown) => {
           cbRef.current.onVideoError(`流错误：${errType}/${errDetail}`);
-          handleFailure(mode === 'live');
+          handleFailure(isLive);
         });
+
+        // ★ 外部延迟兜底：页面切后台后 JS 定时器被节流，库内追帧失效，
+        //   回到前台时缓冲可能堆到几十秒。每 2s 检查一次，超 8s 直接跳到直播沿。
+        latencyGuard = window.setInterval(() => {
+          if (destroyed || v.paused || !v.buffered?.length) return;
+          const end = v.buffered.end(v.buffered.length - 1);
+          if (end - v.currentTime > 8) {
+            try { v.currentTime = end - 1.5; } catch {}
+          }
+        }, 2000);
       } catch { playNative(); }
     };
 
@@ -242,6 +264,7 @@ function LiveVideoPlayer({
 
     return () => {
       destroyed = true;
+      if (latencyGuard != null) { window.clearInterval(latencyGuard); latencyGuard = null; }
       v.removeEventListener('ended', onEnded);
       v.removeEventListener('error', onErr);
       v.removeEventListener('playing', onPlaying);
