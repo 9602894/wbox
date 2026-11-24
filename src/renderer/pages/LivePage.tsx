@@ -1,5 +1,5 @@
 // src/renderer/pages/LivePage.tsx
-// 直播页：频道/分组/EPG/订阅/记忆逻辑保持不变；直播播放改为打开独立播放器窗口（mpv 内核）。
+// 直播页：频道/分组/EPG/订阅/记忆逻辑保持不变；直播播放打开独立播放器窗口（mpv 内核）。
 //
 // ⚠️ 架构说明（基于仓库真实代码，勿改回主窗口内嵌 mpv）：
 //   - MpvController 通过 `--wid` 把 mpv 嵌入**整个 BrowserWindow**（hwndOf / MpvController.start）。
@@ -7,6 +7,10 @@
 //   - 只有 PlayerWindow（transparent: true）能嵌入 mpv；VideoPlayer.allowMpv 注释明确
 //     「仅独立播放器窗口传 true，主窗口里的直播保持纯 HTML5」。
 //   - 因此 LivePage 改为打开独立播放器窗口播放（与点播一致），mpv 在该窗口内渲染。
+//
+// ★ 2026-11-24（用户报「TS 直播缓存太久」）：真正解决 TS 慢的参数在
+//   src/main/player/MpvController.ts 的 startInternal 里（probesize / analyzeduration），
+//   不在本文件。LivePage 只负责透传 URL 类型（meta.streamType），方便主进程按流类型差异化。
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { client } from '../api/client';
 import { ipcInvoke } from '../api/ipc';
@@ -27,6 +31,14 @@ function loadLiveMem(): LiveMem {
 }
 function saveLiveMem(m: LiveMem): void {
   try { localStorage.setItem(LIVE_MEM_KEY, JSON.stringify(m)); } catch { /* ignore */ }
+}
+
+/** 按 URL 后缀判断直播流类型（供主进程差异化 mpv 参数；纯辅助，不阻塞播放） */
+function detectStreamType(url: string): 'hls' | 'ts' | 'other' {
+  const path = url.toLowerCase().split('?')[0].split('#')[0];
+  if (path.endsWith('.m3u8')) return 'hls';
+  if (path.endsWith('.ts')) return 'ts';
+  return 'other';
 }
 
 type EpgStatus = 'idle' | 'loading' | 'ok' | 'empty' | 'error';
@@ -56,9 +68,12 @@ export default function LivePage() {
 
   /** 打开独立播放器窗口播放直播（mpv 内核）。
    *  PlayerInit 结构见 src/main/player/PlayerWindow.ts；lastUrl 非空时 PlayerPage 直接用它播放，
-   *  不走 client.play 解析。 */
+   *  不走 client.play 解析。
+   *  ★ 透传 streamType：主进程 MpvController 可据此对 TS / HLS 用不同探测参数
+   *    （当前默认统一激进参数已能解决 TS 慢，streamType 是可选扩展）。 */
   const openLivePlayer = useCallback((url: string, name: string) => {
     if (!url) return;
+    const streamType = detectStreamType(url);
     const init = {
       key: '',
       flag: '',
@@ -68,7 +83,7 @@ export default function LivePage() {
       subtitleTitle: name,
       lastUrl: url,
       lastName: name,
-      meta: { sourceName: '直播' },
+      meta: { sourceName: '直播', streamType },
     };
     void ipcInvoke(IPC.PLAYER_OPEN, init).catch((e) => {
       setErr(`打开播放器窗口失败：${(e as Error).message}`);
@@ -315,7 +330,9 @@ export default function LivePage() {
                 <div className="live-player" style={{ position: 'relative', minHeight: 260, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 10, background: '#000', color: '#ccc', borderRadius: 8, padding: 16, textAlign: 'center' }}>
                   <div style={{ fontSize: 16, fontWeight: 600 }}>{channelName || '直播'}</div>
                   <div style={{ fontSize: 12, opacity: 0.7, maxWidth: '85%', wordBreak: 'break-all' }}>{playUrl}</div>
-                  <div style={{ fontSize: 12, opacity: 0.55 }}>直播由独立播放器窗口（mpv 内核）播放</div>
+                  <div style={{ fontSize: 12, opacity: 0.55 }}>
+                    直播由独立播放器窗口（mpv 内核）播放 · 流类型 {detectStreamType(playUrl) === 'hls' ? 'HLS' : detectStreamType(playUrl) === 'ts' ? 'TS（已启用快速探测）' : '其他'}
+                  </div>
                   <button type="button" onClick={() => openLivePlayer(playUrl, channelName)}
                     style={{ padding: '6px 18px', borderRadius: 6, border: '1px solid #555', background: '#1f1f1f', color: '#eee', cursor: 'pointer' }}>
                     用 mpv 打开
