@@ -469,7 +469,7 @@ jobs:
         shell: pwsh
         run: |
           if (-not (Test-Path "LICENSE.txt")) {
-            "MIT License`n`nCopyright (c) 2026 Win-Box" | Out-File -Encoding utf8 LICENSE.txt
+            "MIT License`n`nCopyright (c) 2026 Live-Pro" | Out-File -Encoding utf8 LICENSE.txt
           }
 
       - name: Package with electron-builder
@@ -491,7 +491,7 @@ jobs:
         if: github.event.inputs.action != 'delete-only'
         uses: actions/upload-artifact@v4
         with:
-          name: win-box-installer-${{ steps.ver.outputs.full }}
+          name: live-pro-installer-${{ steps.ver.outputs.full }}
           path: |
             ${{ steps.ver.outputs.output_dir }}/*.exe
             ${{ steps.ver.outputs.output_dir }}/*.blockmap
@@ -502,16 +502,16 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
-          name: Win-Box ${{ steps.ver.outputs.base }} · ${{ steps.ver.outputs.bj_stamp }}
+          name: Live-Pro ${{ steps.ver.outputs.base }} · ${{ steps.ver.outputs.bj_stamp }}
           body: |
-            ## Win-Box ${{ steps.ver.outputs.base }} · ${{ steps.ver.outputs.bj_stamp }}
+            ## Live-Pro ${{ steps.ver.outputs.base }} · ${{ steps.ver.outputs.bj_stamp }}
 
             > 北京时间：`${{ steps.ver.outputs.bj_stamp }}`（UTC+8）
             > Commit：`${{ github.sha }}`
             > 回退：`git checkout ${{ github.sha }}`
 
             ### 下载
-            - `Win-Box Setup ${{ steps.ver.outputs.full }}.exe`
+            - `Live-Pro Setup ${{ steps.ver.outputs.full }}.exe`
             - `latest.yml` / `*.blockmap`
           files: |
             ${{ steps.ver.outputs.output_dir }}/*.exe
